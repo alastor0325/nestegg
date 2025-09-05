@@ -3458,3 +3458,210 @@ int nestegg_sniff_mkv(unsigned char const* buffer, size_t length)
 {
   return ne_sniff(buffer, length, DOCTYPE_MKV);
 }
+
+/* Count frames in a Block/SimpleBlock from its lacing header, then skip the
+   remaining payload. Sets framesOut; returns 1 on success, <0 on error. */
+static int
+ne_read_block_lacing(nestegg * ctx, uint64_t block_size, uint64_t* framesOut)
+{
+  int r;
+  int64_t timecode;
+  uint64_t track_number, length, flags, frames, header_bytes, remaining;
+  unsigned int lacing;
+
+  if (block_size > LIMIT_BLOCK)
+    return -1;
+
+  r = ne_read_vint(ctx->io, &track_number, &length);
+  if (r != 1)
+    return r;
+
+  if (track_number == 0)
+    return -1;
+
+  r = ne_read_int(ctx->io, &timecode, 2);
+  if (r != 1)
+    return r;
+
+  r = ne_read_uint(ctx->io, &flags, 1);
+  if (r != 1)
+    return r;
+
+  frames = 0;
+  lacing = (flags & BLOCK_FLAGS_LACING) >> 1;
+
+  switch (lacing) {
+  case LACING_NONE:
+    frames = 1;
+    break;
+  case LACING_XIPH:
+  case LACING_FIXED:
+  case LACING_EBML:
+    r = ne_read_uint(ctx->io, &frames, 1);
+    if (r != 1)
+      return r;
+    frames += 1;
+    break;
+  default:
+    assert(0);
+    return -1;
+  }
+
+  if (frames > 256)
+    return -1;
+
+   /* Skip the remainder of the block payload. */
+  header_bytes = length + 2 + 1 + (lacing == LACING_NONE ? 0 : 1);
+  if (block_size < header_bytes)
+    return -1;
+  remaining = block_size - header_bytes;
+  if (remaining) {
+    r = ne_io_read_skip(ctx->io, remaining);
+    if (r != 1)
+      return r;
+  }
+
+  *framesOut = frames;
+  return 1;
+}
+
+/* Consume the payload of a SimpleBlock or BlockGroup:
+   - If block-like, count frames via lacing and add to addFramesOut.
+   - If not, skip the payload.
+   Always advances I/O to the end of the element.
+   Returns 1 on success, <0 on error. */
+static int
+ne_sum_block_or_group(nestegg * ctx, uint64_t id, uint64_t size, uint64_t * framesOut)
+{
+  int r;
+
+  if (id == ID_SIMPLE_BLOCK) {
+    uint64_t frames;
+    frames = 0;
+    r = ne_read_block_lacing(ctx, size, &frames);
+    if (r != 1)
+      return r;
+    *framesOut += frames;
+    return 1;
+  }
+
+  if (id == ID_BLOCK_GROUP) {
+    int64_t group_end;
+    group_end = ne_io_tell(ctx->io) + (int64_t) size;
+    while (ne_io_tell(ctx->io) < group_end) {
+      uint64_t gid, gsize;
+      r = ne_read_element(ctx, &gid, &gsize);
+      if (r != 1)
+        return r;
+
+      if (gid == ID_BLOCK) {
+        uint64_t frames;
+        frames = 0;
+        r = ne_read_block_lacing(ctx, gsize, &frames);
+        if (r != 1)
+          return r;
+        *framesOut += frames;
+      } else {
+        r = ne_io_read_skip(ctx->io, gsize);
+        if (r != 1)
+          return r;
+      }
+    }
+    return 1;
+  }
+
+  /* Not a block-like element: skip its payload. */
+  r = ne_io_read_skip(ctx->io, size);
+  if (r != 1)
+    return r;
+
+  return 1;
+}
+
+/* Read ONE Cluster and return the sum of frames of ALL SimpleBlock/Block in it.
+   Returns 1 on success (Cluster found), 0 on clean EOS before any Cluster,
+   <0 on error. */
+static int
+ne_read_cluster_frames_count(nestegg * ctx, uint64_t * framesOut)
+{
+  int r;
+  uint64_t id, size;
+  int64_t cluster_end;
+  uint64_t totalFrames;
+
+  assert(ctx->ancestor == NULL);
+
+  /* Find the next Cluster at the top level. */
+  for (;;) {
+    r = ne_read_element(ctx, &id, &size);
+    if (r == 0) {
+      return 0; /* EOS before any Cluster */
+    }
+    if (r != 1) {
+      return r; /* error */
+    }
+
+    if (id != ID_CLUSTER) {
+      /* Not a Cluster: consume and keep scanning. */
+      r = ne_io_read_skip(ctx->io, size);
+      if (r != 1)
+        return r;
+      continue;
+    }
+
+    /* Enter Cluster body by range. */
+    cluster_end = ne_io_tell(ctx->io) + (int64_t) size;
+    totalFrames = 0;
+
+    while (ne_io_tell(ctx->io) < cluster_end) {
+      uint64_t cid, csize;
+      r = ne_read_element(ctx, &cid, &csize);
+      if (r != 1)
+        return r;
+
+      /* Sum frames for blocks; skip other children. */
+      r = ne_sum_block_or_group(ctx, cid, csize, &totalFrames);
+      if (r != 1)
+        return r;
+    }
+
+    *framesOut = totalFrames;
+    ctx->log(ctx, NESTEGG_LOG_DEBUG,
+             "ne_read_cluster_frames_count: totalFrames=%llu", totalFrames);
+    return 1;
+  }
+}
+
+int
+nestegg_read_total_frames_count(nestegg * context, uint64_t * framesOut)
+{
+  struct saved_state saved;
+  uint64_t totalFrames;
+  int r;
+
+  if (!context || !framesOut)
+    return -1;
+
+  ne_ctx_save(context, &saved);
+
+  totalFrames = 0;
+  for (;;) {
+    uint64_t clusterFrames;
+    clusterFrames = 0;
+    r = ne_read_cluster_frames_count(context, &clusterFrames);
+    if (r == 0) {
+      /* EOS */
+      break;
+    }
+    if (r < 0) {
+      ne_ctx_restore(context, &saved);
+      return -1;
+    }
+    totalFrames += clusterFrames;
+  }
+
+  ne_ctx_restore(context, &saved);
+
+  *framesOut = totalFrames;
+  return 0;
+}
